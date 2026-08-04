@@ -18,8 +18,8 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -133,20 +133,6 @@ pub enum CompactionFilter {
     Prefix(Bytes),
 }
 
-/// The storage interface of the LSM tree.
-pub(crate) struct LsmStorageInner {
-    pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
-    pub(crate) state_lock: Mutex<()>,
-    path: PathBuf,
-    pub(crate) block_cache: Arc<BlockCache>,
-    next_sst_id: AtomicUsize,
-    pub(crate) options: Arc<LsmStorageOptions>,
-    pub(crate) compaction_controller: CompactionController,
-    pub(crate) manifest: Option<Manifest>,
-    pub(crate) mvcc: Option<LsmMvccInner>,
-    pub(crate) compaction_filters: Arc<Mutex<Vec<CompactionFilter>>>,
-}
-
 /// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
 pub struct MiniLsm {
     pub(crate) inner: Arc<LsmStorageInner>,
@@ -242,6 +228,20 @@ impl MiniLsm {
     }
 }
 
+/// The storage interface of the LSM tree.
+pub(crate) struct LsmStorageInner {
+    pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
+    pub(crate) state_lock: Mutex<()>,
+    path: PathBuf,
+    pub(crate) block_cache: Arc<BlockCache>,
+    next_sst_id: AtomicUsize,
+    pub(crate) options: Arc<LsmStorageOptions>,
+    pub(crate) compaction_controller: CompactionController,
+    pub(crate) manifest: Option<Manifest>,
+    pub(crate) mvcc: Option<LsmMvccInner>,
+    pub(crate) compaction_filters: Arc<Mutex<Vec<CompactionFilter>>>,
+}
+
 impl LsmStorageInner {
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
@@ -297,8 +297,34 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let readable_state = self.state.read();
+
+        match readable_state.memtable.get(key) {
+            Some(value) => {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(value))
+            }
+            None => {
+                for mem_table in &readable_state.imm_memtables {
+                    match mem_table.get(key) {
+                        Some(value) => {
+                            if value.is_empty() {
+                                return Ok(None);
+                            }
+                            return Ok(Some(value));
+                        }
+                        None => {
+                            continue;
+                        }
+                    }
+                }
+
+                Ok(None)
+            }
+        }
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -307,13 +333,42 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        // Because MemTable::put requires only an immutable reference, you need only a read lock on state,
+        // even when writing to the memtable.
+        // This design allows multiple threads to access the memtable concurrently.
+        let readable_state = self.state.read();
+        let size = key.len() + value.len();
+        //This strategy avoids a race condition where two threads check that the current memtable
+        //is about to reach capacity, both of them decide to freeze it, and one of them might
+        //freeze the newly created empty memtable immediately after the other thread installs it
+        if readable_state.memtable.approximate_size() >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            if readable_state.memtable.approximate_size() >= self.options.target_sst_size {
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+
+        readable_state.memtable.put(key, value)
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        // Because MemTable::put requires only an immutable reference, you need only a read lock on state,
+        // even when writing to the memtable.
+        // This design allows multiple threads to access the memtable concurrently.
+        let readable_state = self.state.read();
+
+        let size = key.len();
+
+        if readable_state.memtable.approximate_size() >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            if readable_state.memtable.approximate_size() >= self.options.target_sst_size {
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+
+        readable_state.memtable.put(key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -338,7 +393,16 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let id = self.next_sst_id();
+        let memtable = Arc::new(MemTable::create(id));
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            let old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
+            snapshot.imm_memtables.insert(0, old_memtable);
+            *guard = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
