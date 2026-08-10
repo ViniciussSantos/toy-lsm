@@ -332,24 +332,38 @@ impl LsmStorageInner {
         unimplemented!()
     }
 
+    fn should_freeze_memtable(&self) -> bool {
+        let readable_state = self.state.read();
+        readable_state.memtable.approximate_size() >= self.options.target_sst_size
+    }
+
+    fn try_freeze_if_full(&self) -> Result<()> {
+        if self.should_freeze_memtable() {
+            let state_lock = self.state_lock.lock();
+            if self.should_freeze_memtable() {
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         // Because MemTable::put requires only an immutable reference, you need only a read lock on state,
         // even when writing to the memtable.
         // This design allows multiple threads to access the memtable concurrently.
-        let readable_state = self.state.read();
-        let size = key.len() + value.len();
+        //It's necessary to drop the read lock on the LsmStorageState before
+        //calling force_freeze_memtable to avoid a rw deadlock
+        {
+            let readable_state = self.state.read();
+            readable_state.memtable.put(key, value)?;
+        }
         //This strategy avoids a race condition where two threads check that the current memtable
         //is about to reach capacity, both of them decide to freeze it, and one of them might
         //freeze the newly created empty memtable immediately after the other thread installs it
-        if readable_state.memtable.approximate_size() >= self.options.target_sst_size {
-            let state_lock = self.state_lock.lock();
-            if readable_state.memtable.approximate_size() >= self.options.target_sst_size {
-                self.force_freeze_memtable(&state_lock)?;
-            }
-        }
 
-        readable_state.memtable.put(key, value)
+        self.try_freeze_if_full()?;
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
@@ -357,18 +371,14 @@ impl LsmStorageInner {
         // Because MemTable::put requires only an immutable reference, you need only a read lock on state,
         // even when writing to the memtable.
         // This design allows multiple threads to access the memtable concurrently.
-        let readable_state = self.state.read();
-
-        let size = key.len();
-
-        if readable_state.memtable.approximate_size() >= self.options.target_sst_size {
-            let state_lock = self.state_lock.lock();
-            if readable_state.memtable.approximate_size() >= self.options.target_sst_size {
-                self.force_freeze_memtable(&state_lock)?;
-            }
+        {
+            let readable_state = self.state.read();
+            readable_state.memtable.put(key, &[])?;
         }
 
-        readable_state.memtable.put(key, &[])
+        self.try_freeze_if_full()?;
+
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
