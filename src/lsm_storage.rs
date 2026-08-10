@@ -332,13 +332,14 @@ impl LsmStorageInner {
         unimplemented!()
     }
 
+    //Maybe this function isn't necessary? Maybe I can inline this logic inside of try_freeze_if_full?
     fn should_freeze_memtable(&self) -> bool {
         let readable_state = self.state.read();
         readable_state.memtable.approximate_size() >= self.options.target_sst_size
     }
 
-    fn try_freeze_if_full(&self) -> Result<()> {
-        if self.should_freeze_memtable() {
+    fn try_freeze_if_full(&self, approximate_size: usize) -> Result<()> {
+        if approximate_size >= self.options.target_sst_size {
             let state_lock = self.state_lock.lock();
             if self.should_freeze_memtable() {
                 self.force_freeze_memtable(&state_lock)?;
@@ -354,15 +355,16 @@ impl LsmStorageInner {
         // This design allows multiple threads to access the memtable concurrently.
         //It's necessary to drop the read lock on the LsmStorageState before
         //calling force_freeze_memtable to avoid a rw deadlock
-        {
+        let size = {
             let readable_state = self.state.read();
             readable_state.memtable.put(key, value)?;
-        }
+            readable_state.memtable.approximate_size()
+        };
         //This strategy avoids a race condition where two threads check that the current memtable
         //is about to reach capacity, both of them decide to freeze it, and one of them might
         //freeze the newly created empty memtable immediately after the other thread installs it
 
-        self.try_freeze_if_full()?;
+        self.try_freeze_if_full(size)?;
         Ok(())
     }
 
@@ -371,12 +373,13 @@ impl LsmStorageInner {
         // Because MemTable::put requires only an immutable reference, you need only a read lock on state,
         // even when writing to the memtable.
         // This design allows multiple threads to access the memtable concurrently.
-        {
+        let size = {
             let readable_state = self.state.read();
             readable_state.memtable.put(key, &[])?;
-        }
+            readable_state.memtable.approximate_size()
+        };
 
-        self.try_freeze_if_full()?;
+        self.try_freeze_if_full(size)?;
 
         Ok(())
     }
